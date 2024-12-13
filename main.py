@@ -31,9 +31,6 @@ transform = transforms.Compose([
 root_dir = "E:/data/"
 dataset = WoundDataset(root_dir, transform=transform)
 
-# Initialize DataLoader
-dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=2)
-
 dir_checkpoint = Path('./checkpoints/')
 
 
@@ -62,8 +59,8 @@ def train_model(
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
     # 3. Create data loaders
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=True, num_workers=2)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=1)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=True, num_workers=1)
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
     optimizer = optim.RMSprop(model.parameters(),
@@ -133,7 +130,6 @@ def train_model(
                         try:
                             input_image = images[0].cpu().numpy().transpose(1, 2, 0)  # Convert to HWC format
                             label_image = masks_pred.argmax(dim=1)[0].cpu().numpy()  # Convert to HWC format
-
                             # Plot the images side by side
                             fig, axes = plt.subplots(1, 2, figsize=(10, 5))
                             # Display the images with their dimensions in the title

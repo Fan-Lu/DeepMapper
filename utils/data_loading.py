@@ -55,14 +55,14 @@ class WoundDataset(Dataset):
         # uncropped_image = Image.open(uncropped_path).convert("RGB")
         # cropped_image = Image.open(cropped_path).convert("RGB")
 
-        uncropped_image = cv.imread(uncropped_path)# [600:3500, 2200:5000]
-        cropped_image = cv.imread(cropped_path)# [600:3500, 2200:5000]
+        uncropped_image = cv.imread(uncropped_path)[600:3500, 2200:5000]
+        cropped_image = cv.imread(cropped_path)[600:3500, 2200:5000]
         cropped_image = np.where(cropped_image > 0, 1, cropped_image)
-        cropped_image = cropped_image[:, :, 0] & cropped_image[:, :, 1] & cropped_image[:, :, 2]
+        cropped_image = (cropped_image[:, :, 0] & cropped_image[:, :, 1] & cropped_image[:, :, 2]) * 255
 
-        uncropped_image = Image.fromarray(cv.cvtColor(uncropped_image, cv.COLOR_BGR2RGB)).convert("RGB")
         cropped_image = Image.fromarray(cropped_image)
         cropped_image = cropped_image.resize((256, 256))
+        uncropped_image = Image.fromarray(cv.cvtColor(uncropped_image, cv.COLOR_BGR2RGB)).convert("RGB")
         uncropped_image = uncropped_image.resize((256, 256))
 
         # Apply transforms if needed
