@@ -8,12 +8,9 @@ Created on Thu Jul 25 19:13:56 2024
 import numpy as np
 import math
 
-import matplotlib.pyplot as plt
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
 
 class SingleHead(nn.Module):
     """
@@ -112,7 +109,6 @@ class MultiHead(nn.Module):
         out = self.dropout(self.proj(out))
         return out
 
-
 def fully_connected(n_embed, fc_dim, dropout):
     return nn.Sequential(
         nn.Linear(n_embed, fc_dim),
@@ -120,7 +116,6 @@ def fully_connected(n_embed, fc_dim, dropout):
         nn.Linear(fc_dim, n_embed),
         nn.Dropout(dropout),
     )
-
 
 def get_angles(pos, k, d):
     # k: [0, d)
@@ -145,6 +140,7 @@ def positional_encoding(positions, d):
     angle_rads[:, 1::2] = np.cos(angle_rads[:, 1::2])
     pos_encoding = angle_rads[np.newaxis,]
     return torch.tensor(pos_encoding, dtype=torch.float32)
+
 
 class EncoderLayer(nn.Module):
 
@@ -280,10 +276,10 @@ class Tranformer(nn.Module):
         return x
 
 
-# define the NN architecture
-class AttentionAE(nn.Module):
-    def __init__(self, h_dim=4, seq_len=8, dropout=0.5):
-        super(AttentionAE, self).__init__()
+class RNNAE(nn.Module):
+    def __init__(self, h_dim=4, seq_len=8, dropout=0.5, device='cpu'):
+        super(RNNAE, self).__init__()
+        self.device = device
         ## encoder layers ##
         # conv layer (depth from 3 --> 16), 3x3 kernels
         self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
@@ -326,7 +322,7 @@ class AttentionAE(nn.Module):
 
         self.ks_omega = nn.Parameter(torch.from_numpy(np.array([0.5, 0.3, 0.1])).float(), requires_grad=True)
 
-        self.Amat_masked = torch.zeros((3, 4, 4), requires_grad=False)
+        self.Amat_masked = torch.zeros((3, 4, 4), requires_grad=False).to(self.device)
         self.Amat_masked[0][0][0] = -1.0
         self.Amat_masked[0][1][0] =  1.0
         self.Amat_masked[1][1][1] = -1.0
@@ -336,8 +332,148 @@ class AttentionAE(nn.Module):
 
         self.softmax = nn.Softmax(dim=1)
 
-        self.mina = torch.from_numpy(np.array([0.1, 0.1, 0.1]))
-        self.maxa = torch.from_numpy(np.array([0.9, 0.9, 0.9]))
+        self.mina = torch.from_numpy(np.array([0.1, 0.1, 0.1])).to(self.device)
+        self.maxa = torch.from_numpy(np.array([0.9, 0.9, 0.9])).to(self.device)
+
+        self.n_embed = h_dim
+        self.seq_len = seq_len
+        self.num_heads = 1
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Initial hidden state tensor shape: (num_layers, batch_size, hidden_size)
+        self.h0 = torch.randn(2, 1, 4).to(self.device) # 2 layers, batch size of 1, hidden size of 4
+        self.rnn_layer = nn.RNN(4, 4, 2, batch_first=True)
+
+    def encoder(self, x):
+        ## encode ##
+        # add hidden layers with relu activation function
+        # and maxpooling after
+        bs = x.shape[0]
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)  # compressed representation
+        # add second hidden layer
+        # 1 X 16 X 64 X 64
+        self.feat_layer_1 = x
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)  # compressed representation
+        self.feat_layer_2 = x
+        # add third hidden layer
+        # 1 X 4 X 32 X 32
+        x = x.view(bs, -1)
+        x = F.relu(self.enc_fc1(x))
+        # x = F.softmax(self.enc_fc2(x), dim=1)
+        x = F.sigmoid(self.enc_fc2(x))
+        # x = F.relu(self.enc_fc2(x))
+
+        return x
+
+    def decoder(self, z):
+        ## decode ##
+        bs = z.shape[0]
+        z = F.relu(self.dec_fc1(z))
+        z = F.relu(self.dec_fc2(z))
+        z = z.view(bs, 4, 32, 32)
+        z = torch.concat([z, self.feat_layer_2.data], dim=1)
+        # add transpose conv layers, with relu activation function
+        z = F.relu(self.t_conv1(z))
+        # add transpose conv layers, with relu activation function
+        z = torch.concat([z, self.feat_layer_1.data], dim=1)
+        z = F.sigmoid(self.t_conv2(z))
+
+        return z
+    
+    def seqEmbed(self, z):
+        # z shape (B, T, C)
+        # seq_len = z.shape[1]
+        # Scale embedding by multiplying it by the square root of the embedding dimension
+        # z *= self.n_embed ** 0.5
+        self.h0 = self.h0.detach()  # Detach h0 from the computation graph to prevent backpropagation through it
+        z, self.h0 = self.rnn_layer(z, self.h0)
+        ks = F.relu(self.A_fc1(z))
+        ks = F.tanh(self.A_fc2(ks))
+        # ks = F.sigmoid(self.A_fc2(ks))
+        ks_omega = F.sigmoid(self.ks_omega)
+
+        return ks + ks_omega
+
+    def shift(self, z, ks, time_dif=7200 * 5):
+        # ks = torch.clip(ks, self.mina, self.maxa).float()
+        ks = torch.clip(ks, 0, 1).float()
+        self.Kh, self.Ki, self.Kp = ks.cpu().data.squeeze().numpy()
+        Amat = torch.tensordot(ks.reshape(1, 1, -1), self.Amat_masked, dims=[[2], [0]]).squeeze()
+        Az = torch.matmul(Amat, z)
+        # default sample time is 7200 seconds
+        z_next = z + Az * self.sample_time * (time_dif / 7200.0)
+        return z_next
+
+    def forward(self, x):
+        z = self.encoder(x)
+        x_hat = self.decoder(z)
+
+        return z, x_hat
+
+
+
+# define the NN architecture
+class AttentionAE(nn.Module):
+    def __init__(self, h_dim=4, seq_len=8, dropout=0.5, device='cpu'):
+        super(AttentionAE, self).__init__()
+        self.device = device
+        ## encoder layers ##
+        # conv layer (depth from 3 --> 16), 3x3 kernels
+        self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
+        # conv layer (depth from 8 --> 4), 3x3 kernels
+        self.conv2 = nn.Conv2d(16, 4, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(4)
+        # conv layer (depth from 4 --> 1), 3x3 kernels
+        # self.conv3 = nn.Conv2d(4, 1, 3, padding=1)
+        # pooling layer to reduce x-y dims by two; kernel and stride of 2
+        self.pool = nn.MaxPool2d(2, 2)
+
+        self.enc_fc1 = nn.Linear(4 * 32 * 32, 128)
+        self.enc_fc2 = nn.Linear(128, h_dim)
+        # self.enc_fc3 = nn.Linear(64, h_dim)
+
+        self.dec_fc1 = nn.Linear(h_dim, 128)
+        self.dec_fc2 = nn.Linear(128, 4 * 32 * 32)
+
+        self.A_fc1 = nn.Linear(h_dim, 16)
+        self.A_fc2 = nn.Linear(16, 3)
+        # self.A_fc3 = nn.Linear(64, 32)
+        # self.A_fc4 = nn.Linear(32, 3)
+
+        ## decoder layers ##
+        ## a kernel of 2 and a stride of 2 will increase the spatial dims by 2
+        # self.t_conv1 = nn.ConvTranspose2d(1, 4, 2, stride=2)
+        self.t_conv1 = nn.ConvTranspose2d(8, 16, 2, stride=2)
+        self.t_b1 = nn.BatchNorm2d(16)
+        self.t_conv2 = nn.ConvTranspose2d(32, 3, 2, stride=2)
+        self.t_b2 = nn.BatchNorm2d(3)
+
+        # sampling time
+        # self.sample_time = 0.1001
+        self.sample_time = 0.2
+
+        self.Kh = 0.5
+        self.Ki = 0.3
+        self.Kp = 0.1
+
+        self.ks_omega = nn.Parameter(torch.from_numpy(np.array([0.5, 0.3, 0.1])).float(), requires_grad=True)
+
+        self.Amat_masked = torch.zeros((3, 4, 4), requires_grad=False).to(self.device)
+        self.Amat_masked[0][0][0] = -1.0
+        self.Amat_masked[0][1][0] =  1.0
+        self.Amat_masked[1][1][1] = -1.0
+        self.Amat_masked[1][2][1] =  1.0
+        self.Amat_masked[2][2][2] = -1.0
+        self.Amat_masked[2][3][2] =  1.0
+
+        self.softmax = nn.Softmax(dim=1)
+
+        self.mina = torch.from_numpy(np.array([0.1, 0.1, 0.1])).to(self.device)
+        self.maxa = torch.from_numpy(np.array([0.9, 0.9, 0.9])).to(self.device)
 
         self.n_embed = h_dim
         self.seq_len = seq_len
@@ -345,7 +481,12 @@ class AttentionAE(nn.Module):
         n_layers = 1
 
         self.dropout = nn.Dropout(dropout)
-        self.att_layers = nn.ModuleList([DecoderLayer(self.n_embed, self.seq_len, self.num_heads, dropout) for _ in range(n_layers)])
+        self.att_layers = nn.ModuleList([
+            DecoderLayer(
+                self.n_embed, 
+                self.seq_len, 
+                self.num_heads, dropout) for _ in range(n_layers)
+            ])
 
     def encoder(self, x):
         ## encode ##
@@ -385,12 +526,12 @@ class AttentionAE(nn.Module):
 
         return z
 
-    def attention(self, z):
+    def seqEmbed(self, z):
         # z shape (B, T, C)
         # seq_len = z.shape[1]
         # Scale embedding by multiplying it by the square root of the embedding dimension
         # z *= self.n_embed ** 0.5
-        z = z + 2.0 * positional_encoding(z.shape[1], 4)
+        z = z + 2.0 * positional_encoding(z.shape[1], 4).to(self.device)
         z = self.dropout(z)
         for layer in self.att_layers:
             z = layer(z)
